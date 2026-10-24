@@ -34,7 +34,7 @@ int displayStart = 0;
 bool inSubMode = false;
 
 bool relayState = false;
-bool apState = true; // 默认开启AP
+bool apState = true; 
 String staSSID = "";
 String staPass = "";
 bool staConnected = false;
@@ -67,6 +67,22 @@ unsigned long lastWifiTime = 0;
 int lastCLKState;
 int clickCount = 0;
 unsigned long firstClickTime = 0;
+
+// ================= 函数前向声明（解决未声明报错） =================
+void handleRoot();
+void handleData();
+void handleWave();
+void handleToggleRelay();
+void handleToggleAP();
+void handleConnect();
+void drawMainMenu();
+void runRadarMode();
+void runTempHumidMode();
+void runHeartbeatMode();
+void runSoundMode();
+void runIRMode();
+void runWifiInfoMode();
+void runSystemInfoMode();
 
 // ================= 前端网页 (带 ECharts) =================
 const char* htmlPage = R"rawliteral(
@@ -214,7 +230,6 @@ void handleConnect() {
   if (server.hasArg("ssid") && server.hasArg("pwd")) {
     staSSID = server.arg("ssid");
     staPass = server.arg("pwd");
-    
     WiFi.begin(staSSID.c_str(), staPass.c_str());
     server.send(200, "text/plain", "Connecting...");
   } else {
@@ -244,13 +259,9 @@ void setup() {
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf); 
 
-  // 开启 AP 热点
   WiFi.softAP(apSSID.c_str(), apPass.c_str());
-  
-  // 配置 NTP 时间
   configTime(8 * 3600, 0, "ntp.aliyun.com", "time.pool.aliyun.com");
 
-  // 注册路由
   server.on("/", handleRoot);
   server.on("/api/data", handleData);
   server.on("/api/wave", handleWave);
@@ -265,9 +276,8 @@ void setup() {
 
 // ================= 主循环 =================
 void loop() {
-  server.handleClient(); // 必须高频调用，保证网页响应
+  server.handleClient(); 
   
-  // 处理时间
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 10)) {
     char timeStr[10];
@@ -275,15 +285,12 @@ void loop() {
     currentTimeStr = String(timeStr);
   }
 
-  // 处理路由器连接状态
   if (WiFi.status() == WL_CONNECTED && !staConnected) {
     staConnected = true;
-    Serial.println("路由器连接成功！IP: " + WiFi.localIP().toString());
   } else if (WiFi.status() != WL_CONNECTED && staConnected) {
     staConnected = false;
   }
 
-  // 编码器与按键逻辑
   int currentCLKState = digitalRead(PIN_CLK);
   if (currentCLKState != lastCLKState && currentCLKState == LOW) {
     if (digitalRead(PIN_DT) != currentCLKState) menuIndex = (menuIndex + 1) % totalItems;
@@ -326,7 +333,6 @@ void loop() {
     clickCount = 0; 
   }
 
-  // 子模式执行
   if (inSubMode) {
     if (menuIndex == 0) runRadarMode();
     else if (menuIndex == 1) runTempHumidMode();
@@ -347,7 +353,7 @@ void loop() {
 void drawMainMenu() {
   u8g2.clearBuffer();
   u8g2.drawStr(0, 10, "=== System Menu ===");
-  u8g2.drawStr(100, 10, currentTimeStr.c_str()); // 右上角显示时间
+  u8g2.drawStr(100, 10, currentTimeStr.c_str()); 
 
   if (menuIndex < displayStart) displayStart = menuIndex;
   if (menuIndex >= displayStart + 5) displayStart = menuIndex - 4;
@@ -406,9 +412,8 @@ void runTempHumidMode() {
   }
 }
 
-// 核心：带示波器波形的心率模式
 void runHeartbeatMode() {
-  if (millis() - lastHeartTime > 30) { // 30ms 采样，负责刷新波形
+  if (millis() - lastHeartTime > 30) { 
     lastHeartTime = millis();
     int signal = analogRead(HEART_PIN);
     
