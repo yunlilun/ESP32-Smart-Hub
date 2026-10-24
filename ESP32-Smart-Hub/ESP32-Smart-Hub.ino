@@ -32,12 +32,24 @@ int totalItems = 8;
 int menuIndex = 0;
 int displayStart = 0;
 bool inSubMode = false;
+int relaySubMenu = 0; // 0: 主状态 1: 设置参数
 
+// 继电器高级状态
+enum RelayMode { MANUAL, LOCAL_TIMER, SCHEDULE };
+RelayMode relayMode = MANUAL;
 bool relayState = false;
-bool apState = true; 
-String staSSID = "";
-String staPass = "";
-bool staConnected = false;
+
+// 定时参数
+unsigned long pulseDuration = 500;      // 单次脉冲时长 (ms)
+unsigned long localOnTime = 2000;       // 离线持续开启时长 (ms)
+unsigned long localInterval = 5000;     // 离线间隔时长 (ms)
+String scheduleOnTime = "08:00";        // 联网定时开
+String scheduleOffTime = "20:00";       // 联网定时关
+
+unsigned long lastRelayAction = 0;
+bool isPulsing = false;
+bool scheduleTriggeredOn = false;
+bool scheduleTriggeredOff = false;
 
 // 传感器缓存
 float currentDistance = 0;
@@ -45,10 +57,11 @@ float currentTemp = 0, currentHum = 0;
 int bpm = 0;
 float currentDB = 0;
 int soundMax = 0, soundMin = 4095;
-String irCode = "Waiting...";
 String currentTimeStr = "No Net";
 String apSSID = "ESP32_Smart_Home";
 String apPass = "12345678";
+bool apState = true;
+bool staConnected = false;
 
 // 心跳波形缓存
 #define WAVE_SIZE 100
@@ -61,21 +74,21 @@ unsigned long lastDHTTime = 0;
 unsigned long lastHeartTime = 0;
 unsigned long lastSoundTime = 0;
 unsigned long lastStatusTime = 0;
-unsigned long lastWifiTime = 0;
 
 // 编码器
 int lastCLKState;
 int clickCount = 0;
 unsigned long firstClickTime = 0;
 
-// ================= 函数前向声明 =================
+// 函数声明
 void handleRoot();
 void handleData();
 void handleWave();
 void handleToggleRelay();
-void handleToggleAP();
-void handleConnect();
+void handlePulse();
+void handleSetRelay();
 void drawMainMenu();
+void runRelayMode();
 void runRadarMode();
 void runTempHumidMode();
 void runHeartbeatMode();
@@ -84,20 +97,21 @@ void runIRMode();
 void runWifiInfoMode();
 void runSystemInfoMode();
 
-// ================= 前端网页 (带 ECharts 动态波形) =================
+// ================= 前端网页 =================
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>ESP32 终极物联中枢</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 <style>
 body { font-family: sans-serif; background: #111; color: #fff; text-align: center; margin: 0; padding: 20px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-.card { background: #222; padding: 20px; border-radius: 10px; border: 1px solid #333; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
-.btn { padding: 10px 20px; font-size: 16px; margin: 5px; cursor: pointer; border: none; border-radius: 5px; background: #007BFF; color: white; text-decoration: none;}
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+.card { background: #222; padding: 20px; border-radius: 10px; border: 1px solid #333; box-shadow: 0 4px 8px rgba(0,0,0,0.5); text-align: left;}
+.btn { padding: 10px 15px; font-size: 16px; margin: 5px 0; cursor: pointer; border: none; border-radius: 5px; background: #007BFF; color: white; width: 100%;}
 .btn-on { background: #4CAF50; }
 .btn-off { background: #f44336; }
 .data { font-size: 24px; color: #00BFFF; font-weight: bold; }
-input { padding: 8px; margin: 5px; border-radius: 5px; border: 1px solid #444; background: #333; color: white; width: 120px;}
+input, select { padding: 8px; margin: 5px 0; border-radius: 5px; border: 1px solid #444; background: #333; color: white; width: 90%;}
+.row { display: flex; justify-content: space-between; gap: 10px; align-items: center;}
 #chart { width: 100%; height: 300px; }
 </style></head><body>
 <h1>ESP32 终极物联中枢</h1>
@@ -110,11 +124,34 @@ input { padding: 8px; margin: 5px; border-radius: 5px; border: 1px solid #444; b
     <p>心率: <span class="data" id="bpm">--</span> BPM</p>
     <p>内存: <span class="data" id="ram">--</span> KB</p>
   </div>
+  
   <div class="card">
-    <h2>模块控制</h2>
-    <a href="/toggleRelay" class="btn %RELAY_CLASS%">继电器: %RELAY_STATUS%</a>
-    <a href="/toggleAP" class="btn %AP_CLASS%">热点: %AP_STATUS%</a>
-    <br><br>
+    <h2>继电器高级控制</h2>
+    <p>当前状态: <span class="data" id="relayState">OFF</span> | 模式: <span id="relayMode">MANUAL</span></p>
+    <div class="row">
+        <button class="btn btn-on" onclick="fetch('/toggleRelay')">手动开启</button>
+        <button class="btn btn-off" onclick="fetch('/toggleRelay')">手动关闭</button>
+    </div>
+    <hr>
+    <label>单次脉冲时长 (ms): </label><input type="number" id="pulseMs" value="%PULSE%">
+    <button class="btn" style="background:#ff9800;" onclick="fetch('/pulse?ms='+document.getElementById('pulseMs').value)">触发单次脉冲</button>
+    <hr>
+    <label>模式选择:</label>
+    <select id="modeSel" onchange="updateMode()">
+        <option value="0" %M0%>Manual 手动</option>
+        <option value="1" %M1%>Local Timer 离线循环</option>
+        <option value="2" %M2%>Schedule 联网定时</option>
+    </select>
+    <div id="timerPanel" style="display:%TIMER_DISP%">
+        <label>间隔 (ms): </label><input type="number" id="localInt" value="%LINT%">
+        <label>开启时长 (ms): </label><input type="number" id="localOn" value="%LON%">
+    </div>
+    <div id="schedPanel" style="display:%SCHED_DISP%">
+        <label>开启时间 (HH:MM): </label><input type="text" id="schedOn" value="%SON%">
+        <label>关闭时间 (HH:MM): </label><input type="text" id="schedOff" value="%SOFF%">
+    </div>
+    <button class="btn" style="background:#2196F3; margin-top:15px;" onclick="saveRelaySettings()">保存设置</button>
+    <hr>
     <h3>配网 (连接路由器)</h3>
     <input type="text" id="ssid" placeholder="WiFi 账号">
     <input type="password" id="pwd" placeholder="WiFi 密码">
@@ -129,13 +166,7 @@ input { padding: 8px; margin: 5px; border-radius: 5px; border: 1px solid #444; b
 
 <script>
 var chart = echarts.init(document.getElementById('chart'), 'dark');
-var option = {
-  backgroundColor: 'transparent',
-  xAxis: { type: 'category', show: false },
-  yAxis: { type: 'value', show: false, min: 'dataMin', max: 'dataMax' },
-  series: [{ data: [], type: 'line', smooth: true, lineStyle: { color: '#f44336', width: 3 }, showSymbol: false }]
-};
-chart.setOption(option);
+chart.setOption({ backgroundColor: 'transparent', xAxis: { type: 'category', show: false }, yAxis: { type: 'value', show: false, min: 'dataMin', max: 'dataMax' }, series: [{ data: [], type: 'line', smooth: true, lineStyle: { color: '#f44336', width: 3 }, showSymbol: false }] });
 
 function updateData() {
   fetch('/api/data').then(r => r.json()).then(d => {
@@ -147,6 +178,8 @@ function updateData() {
     document.getElementById('bpm').innerText = d.bpm;
     document.getElementById('ram').innerText = d.ram;
     document.getElementById('wifiStatus').innerText = d.staStatus;
+    document.getElementById('relayState').innerText = d.relayState ? "ON" : "OFF";
+    document.getElementById('relayMode').innerText = d.relayMode;
   }).catch(e => {});
 }
 
@@ -156,12 +189,27 @@ function updateWave() {
   }).catch(e => {});
 }
 
+function updateMode() {
+    let mode = document.getElementById('modeSel').value;
+    document.getElementById('timerPanel').style.display = (mode == '1') ? 'block' : 'none';
+    document.getElementById('schedPanel').style.display = (mode == '2') ? 'block' : 'none';
+}
+
+function saveRelaySettings() {
+    let mode = document.getElementById('modeSel').value;
+    let url = `/api/setRelay?mode=${mode}`;
+    if(mode == '1') {
+        url += `&lint=${document.getElementById('localInt').value}&lon=${document.getElementById('localOn').value}`;
+    } else if(mode == '2') {
+        url += `&son=${document.getElementById('schedOn').value}&soff=${document.getElementById('schedOff').value}`;
+    }
+    fetch(url).then(() => alert('设置已保存！'));
+}
+
 function connectWiFi() {
   let s = document.getElementById('ssid').value;
   let p = document.getElementById('pwd').value;
-  fetch('/api/connect?ssid=' + s + '&pwd=' + p).then(r => {
-    alert('指令已发送，正在连接...');
-  });
+  fetch('/api/connect?ssid=' + s + '&pwd=' + p).then(r => alert('指令已发送'));
 }
 
 setInterval(updateData, 2000);
@@ -170,18 +218,27 @@ setInterval(updateWave, 100);
 </body></html>
 )rawliteral";
 
-// ================= Web 处理函数 =================
+// ================= Web 处理 =================
 void handleRoot() {
   String html = htmlPage;
-  html.replace("%RELAY_STATUS%", relayState ? "打开中" : "关闭中");
-  html.replace("%RELAY_CLASS%", relayState ? "btn-on" : "btn-off");
-  html.replace("%AP_STATUS%", apState ? "开启中" : "关闭中");
-  html.replace("%AP_CLASS%", apState ? "btn-on" : "btn-off");
+  html.replace("%PULSE%", String(pulseDuration));
+  html.replace("%LINT%", String(localInterval));
+  html.replace("%LON%", String(localOnTime));
+  html.replace("%SON%", scheduleOnTime);
+  html.replace("%SOFF%", scheduleOffTime);
+  
+  html.replace("%M0%", relayMode == MANUAL ? "selected" : "");
+  html.replace("%M1%", relayMode == LOCAL_TIMER ? "selected" : "");
+  html.replace("%M2%", relayMode == SCHEDULE ? "selected" : "");
+  
+  html.replace("%TIMER_DISP%", relayMode == LOCAL_TIMER ? "block" : "none");
+  html.replace("%SCHED_DISP%", relayMode == SCHEDULE ? "block" : "none");
   html.replace("%WIFI_STATUS%", staConnected ? ("已连接: " + WiFi.localIP().toString()) : "未连接路由器");
   server.send(200, "text/html", html);
 }
 
 void handleData() {
+  String modeStr = relayMode == MANUAL ? "MANUAL" : (relayMode == LOCAL_TIMER ? "TIMER" : "SCHEDULE");
   String json = "{";
   json += "\"time\":\"" + currentTimeStr + "\",";
   json += "\"temp\":" + String(currentTemp, 1) + ",";
@@ -190,6 +247,8 @@ void handleData() {
   json += "\"db\":" + String(currentDB, 1) + ",";
   json += "\"bpm\":" + String(bpm) + ",";
   json += "\"ram\":" + String(ESP.getFreeHeap() / 1024) + ",";
+  json += "\"relayState\":" + String(relayState ? "true" : "false") + ",";
+  json += "\"relayMode\":\"" + modeStr + "\",";
   json += "\"staStatus\":\"" + String(staConnected ? "已连接" : "未连接") + "\"";
   json += "}";
   server.send(200, "application/json", json);
@@ -207,34 +266,42 @@ void handleWave() {
 }
 
 void handleToggleRelay() {
-  relayState = !relayState;
-  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-  if(!inSubMode) drawMainMenu();
+  if (relayMode == MANUAL) {
+    relayState = !relayState;
+    digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void handleToggleAP() {
-  apState = !apState;
-  if(apState) {
-    WiFi.softAP(apSSID.c_str(), apPass.c_str());
-  } else {
-    WiFi.softAPdisconnect(true);
-  }
-  if(!inSubMode) drawMainMenu();
-  server.sendHeader("Location", "/");
-  server.send(303);
+void handlePulse() {
+  if (server.hasArg("ms")) pulseDuration = server.arg("ms").toInt();
+  digitalWrite(RELAY_PIN, HIGH);
+  relayState = true;
+  isPulsing = true;
+  lastRelayAction = millis();
+  server.send(200, "text/plain", "Pulse Triggered");
 }
 
-void handleConnect() {
-  if (server.hasArg("ssid") && server.hasArg("pwd")) {
-    staSSID = server.arg("ssid");
-    staPass = server.arg("pwd");
-    WiFi.begin(staSSID.c_str(), staPass.c_str());
-    server.send(200, "text/plain", "Connecting...");
-  } else {
-    server.send(400, "text/plain", "Missing args");
+void handleSetRelay() {
+  if (server.hasArg("mode")) {
+    int m = server.arg("mode").toInt();
+    relayMode = (RelayMode)m;
+    
+    if (relayMode == LOCAL_TIMER) {
+      localInterval = server.arg("lint").toInt();
+      localOnTime = server.arg("lon").toInt();
+      lastRelayAction = millis();
+    } else if (relayMode == SCHEDULE) {
+      scheduleOnTime = server.arg("son");
+      scheduleOffTime = server.arg("soff");
+      scheduleTriggeredOn = false;
+      scheduleTriggeredOff = false;
+    } else {
+      digitalWrite(RELAY_PIN, relayState ? HIGH : LOW); // 恢复手动状态
+    }
   }
+  server.send(200, "text/plain", "OK");
 }
 
 // ================= 初始化 =================
@@ -266,8 +333,8 @@ void setup() {
   server.on("/api/data", handleData);
   server.on("/api/wave", handleWave);
   server.on("/toggleRelay", handleToggleRelay);
-  server.on("/toggleAP", handleToggleAP);
-  server.on("/api/connect", handleConnect);
+  server.on("/pulse", handlePulse);
+  server.on("/api/setRelay", handleSetRelay);
   server.begin();
 
   lastCLKState = digitalRead(PIN_CLK);
@@ -280,17 +347,56 @@ void loop() {
   
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 10)) {
-    char timeStr[10];
-    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+    char timeStr[6];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
     currentTimeStr = String(timeStr);
   }
 
-  if (WiFi.status() == WL_CONNECTED && !staConnected) {
-    staConnected = true;
-  } else if (WiFi.status() != WL_CONNECTED && staConnected) {
-    staConnected = false;
+  // 核心：处理继电器的各种模式
+  unsigned long now = millis();
+  
+  if (isPulsing) {
+    if (now - lastRelayAction >= pulseDuration) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = false;
+      isPulsing = false;
+    }
+  } 
+  else if (relayMode == LOCAL_TIMER) {
+    unsigned long elapsed = now - lastRelayAction;
+    if (relayState) {
+      if (elapsed >= localOnTime) {
+        relayState = false;
+        digitalWrite(RELAY_PIN, LOW);
+        lastRelayAction = now;
+      }
+    } else {
+      if (elapsed >= localInterval) {
+        relayState = true;
+        digitalWrite(RELAY_PIN, HIGH);
+        lastRelayAction = now;
+      }
+    }
+  } 
+  else if (relayMode == SCHEDULE && staConnected) {
+    if (currentTimeStr == scheduleOnTime && !scheduleTriggeredOn) {
+      relayState = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      scheduleTriggeredOn = true;
+      scheduleTriggeredOff = false;
+    } else if (currentTimeStr == scheduleOffTime && !scheduleTriggeredOff) {
+      relayState = false;
+      digitalWrite(RELAY_PIN, LOW);
+      scheduleTriggeredOff = true;
+      scheduleTriggeredOn = false;
+    }
   }
 
+  // 处理路由器连接状态
+  if (WiFi.status() == WL_CONNECTED && !staConnected) staConnected = true;
+  else if (WiFi.status() != WL_CONNECTED && staConnected) staConnected = false;
+
+  // 编码器与按键
   int currentCLKState = digitalRead(PIN_CLK);
   if (currentCLKState != lastCLKState && currentCLKState == LOW) {
     if (digitalRead(PIN_DT) != currentCLKState) menuIndex = (menuIndex + 1) % totalItems;
@@ -302,9 +408,9 @@ void loop() {
   if (digitalRead(PIN_SW) == LOW) {
     delay(20);
     if (digitalRead(PIN_SW) == LOW) {
-      unsigned long now = millis();
-      if (clickCount == 0 || (now - firstClickTime > 350)) {
-        clickCount = 1; firstClickTime = now;
+      unsigned long clickNow = millis();
+      if (clickCount == 0 || (clickNow - firstClickTime > 350)) {
+        clickCount = 1; firstClickTime = clickNow;
       } else {
         clickCount = 2;
       }
@@ -315,13 +421,19 @@ void loop() {
   if (clickCount > 0 && (millis() - firstClickTime > 350)) {
     if (clickCount == 1) {
       if (!inSubMode) {
-        if (menuIndex == 2) {
-          relayState = !relayState;
-          digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-          drawMainMenu();
+        if (menuIndex == 2) { // 主菜单点击进入继电器高级模式
+          inSubMode = true;
+          u8g2.clearBuffer();
         } else {
           inSubMode = true;
           u8g2.clearBuffer();
+        }
+      } else {
+        if (menuIndex == 2) { // 在继电器子菜单里点击，切换手动状态
+          if (relayMode == MANUAL) {
+            relayState = !relayState;
+            digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+          }
         }
       }
     } else if (clickCount == 2) {
@@ -333,9 +445,11 @@ void loop() {
     clickCount = 0; 
   }
 
+  // 子模式执行
   if (inSubMode) {
     if (menuIndex == 0) runRadarMode();
     else if (menuIndex == 1) runTempHumidMode();
+    else if (menuIndex == 2) runRelayMode(); // 继电器高级显示
     else if (menuIndex == 3) runHeartbeatMode();
     else if (menuIndex == 4) runSoundMode();
     else if (menuIndex == 5) runIRMode();
@@ -353,7 +467,7 @@ void loop() {
 void drawMainMenu() {
   u8g2.clearBuffer();
   u8g2.drawStr(0, 10, "=== System Menu ===");
-  u8g2.drawStr(100, 10, currentTimeStr.c_str()); 
+  u8g2.drawStr(98, 10, currentTimeStr.c_str()); 
 
   if (menuIndex < displayStart) displayStart = menuIndex;
   if (menuIndex >= displayStart + 5) displayStart = menuIndex - 4;
@@ -372,6 +486,135 @@ void drawMainMenu() {
     }
   }
   u8g2.sendBuffer();
+}
+
+// 新增：继电器高级状态显示界面
+void runRelayMode() {
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 10, "--- Relay Advanced ---");
+  
+  String modeStr = relayMode == MANUAL ? "MANUAL" : (relayMode == LOCAL_TIMER ? "LOCAL TIMER" : "SCHEDULE");
+  u8g2.setCursor(0, 25); u8g2.print("Mode: "); u8g2.print(modeStr);
+  u8g2.setCursor(0, 35); u8g2.print("State: "); u8g2.print(relayState ? "ON" : "OFF");
+  
+  if (relayMode == MANUAL) {
+    u8g2.setCursor(0, 50); u8g2.print("Click to toggle ON/OFF");
+  } else if (relayMode == LOCAL_TIMER) {
+    u8g2.setCursor(0, 45); u8g2.print("Interval: "); u8g2.print(localInterval / 1000); u8g2.print("s");
+    u8g2.setCursor(0, 55); u8g2.print("Pulse  : "); u8g2.print(localOnTime); u8g2.print("ms");
+  } else if (relayMode == SCHEDULE) {
+    u8g2.setCursor(0, 45); u8g2.print("ON  At: "); u8g2.print(scheduleOnTime);
+    u8g2.setCursor(0, 55); u8g2.print("OFF At: "); u8g2.print(scheduleOffTime);
+  }
+  u8g2.drawStr(0, 64, "Dbl click to exit");
+  u8g2.sendBuffer();
+}
+
+// 心率模块：动态滑动阈值 + 波谷检测（终极修复版）
+void runHeartbeatMode() {
+  if (millis() - lastHeartTime > 30) { 
+    lastHeartTime = millis();
+    int raw = analogRead(HEART_PIN);
+    
+    static int lastValidRaw = 2000;
+    if (abs(raw - lastValidRaw) > 300) raw = lastValidRaw;
+    else lastValidRaw = raw;
+    
+    static float filteredVal = 2000;
+    filteredVal = (filteredVal * 0.6) + (raw * 0.4);
+
+    bool fingerDetected = (filteredVal < 2500 && filteredVal > 200);
+
+    static bool wasDetected = false;
+    if (!fingerDetected) {
+      bpm = 0;
+      if (wasDetected) {
+        for (int i = 0; i < WAVE_SIZE; i++) heartWave[i] = 0;
+        wasDetected = false;
+      }
+      
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_ncenB10_tr);
+      u8g2.setCursor(0, 25); u8g2.print("Place Finger");
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 60, "Dbl click to exit");
+      u8g2.sendBuffer();
+      return; 
+    }
+    wasDetected = true;
+
+    heartWave[waveIndex] = (int)filteredVal;
+    waveIndex = (waveIndex + 1) % WAVE_SIZE;
+
+    static int buffer[30] = {0};
+    static int bufIndex = 0;
+    buffer[bufIndex] = filteredVal;
+    bufIndex = (bufIndex + 1) % 30;
+
+    int maxV = 0, minV = 4095;
+    for (int i = 0; i < 30; i++) {
+      if (buffer[i] > maxV) maxV = buffer[i];
+      if (buffer[i] < minV && buffer[i] > 0) minV = buffer[i];
+    }
+    int amplitude = maxV - minV;
+    bool signalValid = (amplitude > 30); 
+
+    int valleyThreshold = minV + (amplitude * 0.3); 
+
+    static bool isInValley = false;
+    static unsigned long lastBeatTime = 0;
+    unsigned long now = millis();
+
+    if (signalValid && filteredVal < valleyThreshold && !isInValley) {
+      if (now - lastBeatTime > 400 && now - lastBeatTime < 1500) {
+        int instantBPM = 60000 / (now - lastBeatTime);
+        if (bpm == 0) bpm = instantBPM;
+        else bpm = (bpm * 0.85) + (instantBPM * 0.15); 
+        lastBeatTime = now;
+      } else if (now - lastBeatTime >= 1500) {
+        lastBeatTime = now; 
+      }
+      isInValley = true;
+    }
+    
+    if (filteredVal > valleyThreshold + 10) {
+      isInValley = false;
+    }
+
+    if (now - lastBeatTime > 3000) bpm = 0;
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.setCursor(0, 12);
+    
+    if (!signalValid) {
+      u8g2.print("Signal Weak");
+    } else if (bpm > 40 && bpm < 150) {
+      u8g2.print(bpm); u8g2.print(" BPM");
+    } else {
+      u8g2.print("Detecting...");
+    }
+
+    int dispMax = maxV, dispMin = minV;
+    if (dispMax - dispMin < 50) dispMax = dispMin + 50;
+    
+    int prevX = 0, prevY = 0;
+    for (int i = 0; i < WAVE_SIZE; i++) {
+      int idx = (waveIndex + i) % WAVE_SIZE;
+      int y = map(heartWave[idx], dispMin, dispMax, 60, 20); 
+      y = constrain(y, 20, 60); 
+      
+      if (i > 0) {
+        if (abs(y - prevY) < 20) u8g2.drawLine(prevX, prevY, i, y);
+      }
+      prevX = i;
+      prevY = y;
+    }
+    
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 64, "Dbl click to exit");
+    u8g2.sendBuffer();
+  }
 }
 
 void runRadarMode() {
@@ -408,118 +651,6 @@ void runTempHumidMode() {
     u8g2.setCursor(0, 30); u8g2.print(currentTemp, 1); u8g2.print(" C");
     u8g2.setCursor(0, 50); u8g2.print(currentHum, 1); u8g2.print(" %");
     u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0, 60, "Dbl click to exit");
-    u8g2.sendBuffer();
-  }
-}
-
-// 心率模块：动态滑动阈值 + 波谷检测（终极修复版）
-void runHeartbeatMode() {
-  if (millis() - lastHeartTime > 30) { 
-    lastHeartTime = millis();
-    int raw = analogRead(HEART_PIN);
-    
-    // 强力平滑滤波，滤除环境光高频闪烁
-    static float filteredVal = 2000;
-    filteredVal = (filteredVal * 0.6) + (raw * 0.4);
-
-    // 在位检测：根据你实际串口观察到的值微调（手放上去数值会变小）
-    bool fingerDetected = (filteredVal < 2500 && filteredVal > 200);
-
-    static bool wasDetected = false;
-    if (!fingerDetected) {
-      bpm = 0;
-      if (wasDetected) {
-        for (int i = 0; i < WAVE_SIZE; i++) heartWave[i] = 0;
-        wasDetected = false;
-      }
-      
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_ncenB10_tr);
-      u8g2.setCursor(0, 25); u8g2.print("Place Finger");
-      u8g2.setFont(u8g2_font_6x10_tf);
-      u8g2.drawStr(0, 60, "Dbl click to exit");
-      u8g2.sendBuffer();
-      return; 
-    }
-    wasDetected = true;
-
-    // 存入波形数组
-    heartWave[waveIndex] = (int)filteredVal;
-    waveIndex = (waveIndex + 1) % WAVE_SIZE;
-
-    // 动态阈值计算（寻找过去 30 个点的最大值和最小值）
-    static int buffer[30] = {0};
-    static int bufIndex = 0;
-    buffer[bufIndex] = filteredVal;
-    bufIndex = (bufIndex + 1) % 30;
-
-    int maxV = 0, minV = 4095;
-    for (int i = 0; i < 30; i++) {
-      if (buffer[i] > maxV) maxV = buffer[i];
-      if (buffer[i] < minV && buffer[i] > 0) minV = buffer[i];
-    }
-    int amplitude = maxV - minV;
-    
-    // 如果振幅太小，说明手指没按好或信号太弱
-    bool signalValid = (amplitude > 30); 
-
-    // 设定动态波谷阈值（处于波谷附近 30% 的位置）
-    int valleyThreshold = minV + (amplitude * 0.3); 
-
-    static bool isInValley = false;
-    static unsigned long lastBeatTime = 0;
-    unsigned long now = millis();
-
-    // 波谷检测逻辑
-    if (signalValid && filteredVal < valleyThreshold && !isInValley) {
-      // 发现波谷，且距离上次心跳超过 400ms，小于 1500ms
-      if (now - lastBeatTime > 400 && now - lastBeatTime < 1500) {
-        int instantBPM = 60000 / (now - lastBeatTime);
-        if (bpm == 0) bpm = instantBPM;
-        else bpm = (bpm * 0.7) + (instantBPM * 0.3); // 平滑 BPM
-        lastBeatTime = now;
-      } else if (now - lastBeatTime >= 1500) {
-        lastBeatTime = now; // 间隔太久，重新同步
-      }
-      isInValley = true;
-    }
-    
-    // 信号回升离开波谷
-    if (filteredVal > valleyThreshold + 10) {
-      isInValley = false;
-    }
-
-    // 超过 3 秒没检测到心跳，清零
-    if (now - lastBeatTime > 3000) {
-      bpm = 0;
-    }
-
-    // 绘制屏幕
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB10_tr);
-    u8g2.setCursor(0, 12);
-    
-    if (!signalValid) {
-      u8g2.print("Signal Weak");
-    } else if (bpm > 40 && bpm < 150) {
-      u8g2.print(bpm); u8g2.print(" BPM");
-    } else {
-      u8g2.print("Detecting...");
-    }
-
-    // 绘制心电图
-    int dispMax = maxV, dispMin = minV;
-    if (dispMax == dispMin) { dispMax += 10; dispMin -= 10; }
-    
-    int prevX = 0, prevY = 0;
-    for (int i = 0; i < WAVE_SIZE; i++) {
-      int idx = (waveIndex + i) % WAVE_SIZE;
-      int y = map(heartWave[idx], dispMin, dispMax, 60, 20); 
-      if (i > 0) u8g2.drawLine(prevX, prevY, i, y);
-      prevX = i; prevY = y;
-    }
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 64, "Dbl click to exit");
     u8g2.sendBuffer();
   }
 }
