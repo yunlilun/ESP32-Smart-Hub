@@ -68,7 +68,7 @@ int lastCLKState;
 int clickCount = 0;
 unsigned long firstClickTime = 0;
 
-// ================= 函数前向声明（解决未声明报错） =================
+// ================= 函数前向声明 =================
 void handleRoot();
 void handleData();
 void handleWave();
@@ -84,7 +84,7 @@ void runIRMode();
 void runWifiInfoMode();
 void runSystemInfoMode();
 
-// ================= 前端网页 (带 ECharts) =================
+// ================= 前端网页 (带 ECharts 动态波形) =================
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="UTF-8">
 <title>ESP32 终极物联中枢</title>
@@ -412,47 +412,109 @@ void runTempHumidMode() {
   }
 }
 
+// 心率模块：动态滑动阈值 + 波谷检测（终极修复版）
 void runHeartbeatMode() {
   if (millis() - lastHeartTime > 30) { 
     lastHeartTime = millis();
-    int signal = analogRead(HEART_PIN);
+    int raw = analogRead(HEART_PIN);
     
-    heartWave[waveIndex] = signal;
-    waveIndex = (waveIndex + 1) % WAVE_SIZE;
-    
-    static int baseline = 2000; 
-    static bool isBeating = false;
-    static unsigned long lastBeat = 0;
-    
-    baseline = (baseline * 0.99) + (signal * 0.01);
-    
-    if (signal > baseline + 150 && !isBeating) {
-      isBeating = true;
-      unsigned long now = millis();
-      if (now - lastBeat > 300 && now - lastBeat < 1500) { 
-        bpm = 60000 / (now - lastBeat); 
-      }
-      lastBeat = now;
-    }
-    if (signal < baseline + 50 && isBeating) isBeating = false;
+    // 强力平滑滤波，滤除环境光高频闪烁
+    static float filteredVal = 2000;
+    filteredVal = (filteredVal * 0.6) + (raw * 0.4);
 
+    // 在位检测：根据你实际串口观察到的值微调（手放上去数值会变小）
+    bool fingerDetected = (filteredVal < 2500 && filteredVal > 200);
+
+    static bool wasDetected = false;
+    if (!fingerDetected) {
+      bpm = 0;
+      if (wasDetected) {
+        for (int i = 0; i < WAVE_SIZE; i++) heartWave[i] = 0;
+        wasDetected = false;
+      }
+      
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_ncenB10_tr);
+      u8g2.setCursor(0, 25); u8g2.print("Place Finger");
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 60, "Dbl click to exit");
+      u8g2.sendBuffer();
+      return; 
+    }
+    wasDetected = true;
+
+    // 存入波形数组
+    heartWave[waveIndex] = (int)filteredVal;
+    waveIndex = (waveIndex + 1) % WAVE_SIZE;
+
+    // 动态阈值计算（寻找过去 30 个点的最大值和最小值）
+    static int buffer[30] = {0};
+    static int bufIndex = 0;
+    buffer[bufIndex] = filteredVal;
+    bufIndex = (bufIndex + 1) % 30;
+
+    int maxV = 0, minV = 4095;
+    for (int i = 0; i < 30; i++) {
+      if (buffer[i] > maxV) maxV = buffer[i];
+      if (buffer[i] < minV && buffer[i] > 0) minV = buffer[i];
+    }
+    int amplitude = maxV - minV;
+    
+    // 如果振幅太小，说明手指没按好或信号太弱
+    bool signalValid = (amplitude > 30); 
+
+    // 设定动态波谷阈值（处于波谷附近 30% 的位置）
+    int valleyThreshold = minV + (amplitude * 0.3); 
+
+    static bool isInValley = false;
+    static unsigned long lastBeatTime = 0;
+    unsigned long now = millis();
+
+    // 波谷检测逻辑
+    if (signalValid && filteredVal < valleyThreshold && !isInValley) {
+      // 发现波谷，且距离上次心跳超过 400ms，小于 1500ms
+      if (now - lastBeatTime > 400 && now - lastBeatTime < 1500) {
+        int instantBPM = 60000 / (now - lastBeatTime);
+        if (bpm == 0) bpm = instantBPM;
+        else bpm = (bpm * 0.7) + (instantBPM * 0.3); // 平滑 BPM
+        lastBeatTime = now;
+      } else if (now - lastBeatTime >= 1500) {
+        lastBeatTime = now; // 间隔太久，重新同步
+      }
+      isInValley = true;
+    }
+    
+    // 信号回升离开波谷
+    if (filteredVal > valleyThreshold + 10) {
+      isInValley = false;
+    }
+
+    // 超过 3 秒没检测到心跳，清零
+    if (now - lastBeatTime > 3000) {
+      bpm = 0;
+    }
+
+    // 绘制屏幕
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB10_tr);
     u8g2.setCursor(0, 12);
-    if (bpm > 30 && bpm < 200) { u8g2.print(bpm); u8g2.print(" BPM"); }
-    else { u8g2.print("Reading..."); }
-
-    int maxVal = 0, minVal = 4095;
-    for (int i = 0; i < WAVE_SIZE; i++) {
-      if (heartWave[i] > maxVal) maxVal = heartWave[i];
-      if (heartWave[i] < minVal && heartWave[i] > 0) minVal = heartWave[i];
+    
+    if (!signalValid) {
+      u8g2.print("Signal Weak");
+    } else if (bpm > 40 && bpm < 150) {
+      u8g2.print(bpm); u8g2.print(" BPM");
+    } else {
+      u8g2.print("Detecting...");
     }
-    if (maxVal == minVal) { maxVal += 10; minVal -= 10; }
+
+    // 绘制心电图
+    int dispMax = maxV, dispMin = minV;
+    if (dispMax == dispMin) { dispMax += 10; dispMin -= 10; }
     
     int prevX = 0, prevY = 0;
     for (int i = 0; i < WAVE_SIZE; i++) {
       int idx = (waveIndex + i) % WAVE_SIZE;
-      int y = map(heartWave[idx], minVal, maxVal, 60, 20); 
+      int y = map(heartWave[idx], dispMin, dispMax, 60, 20); 
       if (i > 0) u8g2.drawLine(prevX, prevY, i, y);
       prevX = i; prevY = y;
     }
