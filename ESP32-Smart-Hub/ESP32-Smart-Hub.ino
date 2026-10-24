@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <time.h>
 #include <math.h>
+#include <IRremote.hpp>  // 红外解码库
 
 // ================= 硬件引脚 =================
 #define PIN_CLK 32
@@ -30,11 +31,11 @@ char jsonBuffer[2048];
 
 // 菜单与状态
 String menuItems[] = {"Radar Sensor", "Temp & Humid", "Relay Control", "Heartbeat", "Sound Meter", "IR Receiver", "WiFi & Time", "System Info", "Factory Reset"};
-int totalItems = 9; // 扩展为 9 个选项
+int totalItems = 9;
 int menuIndex = 0;
 int displayStart = 0;
 bool inSubMode = false;
-int resetConfirmStep = 0; // 恢复出厂设置状态: 0: 初始, 1: 第一次确认, 2: 第二次确认
+int resetConfirmStep = 0; 
 
 // 继电器高级状态
 enum RelayMode { MANUAL, LOCAL_TIMER, SCHEDULE };
@@ -62,8 +63,14 @@ int soundMax = 0, soundMin = 4095;
 String currentTimeStr = "No Net";
 String apSSID = "ESP32_Smart_Home";
 String apPass = "12345678";
-bool apState = true;
 bool staConnected = false;
+
+// 红外缓存
+String irProtocol = "Unknown";
+String irAddress = "0x00";
+String irCommand = "0x00";
+bool hasIRData = false;
+unsigned long lastIRReceiveTime = 0;
 
 // 心跳波形缓存
 #define WAVE_SIZE 100
@@ -79,7 +86,7 @@ unsigned long lastStatusTime = 0;
 
 // 屏幕保护与交互
 unsigned long lastInteractionTime = 0;
-unsigned long screenTimeout = 300000; // 默认 5 分钟 (300,000 毫秒)
+unsigned long screenTimeout = 300000; 
 bool screenOn = true;
 
 // 编码器按键状态
@@ -112,10 +119,10 @@ void runSystemInfoMode();
 void runResetMode();
 void updateInteraction();
 
-// ================= 前端网页 (带时间逻辑、屏幕保护、双重确认重置) =================
+// ================= 前端网页 =================
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>ESP32 终极物联中枢</title>
+<title>ESP32 Smart Hub</title>
 <style>
 body { font-family: sans-serif; background: #111; color: #fff; text-align: center; margin: 0; padding: 20px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
@@ -129,7 +136,7 @@ input, select { padding: 8px; margin: 5px 0; border-radius: 5px; border: 1px sol
 .row { display: flex; justify-content: space-between; gap: 10px; align-items: center;}
 canvas { width: 100%; height: 250px; background: #000; border-radius: 5px; margin-top: 10px; }
 </style></head><body>
-<h1>ESP32 终极物联中枢</h1>
+<h1>ESP32 Smart Hub</h1>
 <div class="grid">
   <div class="card">
     <h2>状态监控</h2>
@@ -252,8 +259,8 @@ function saveScreenSettings() {
 }
 
 function resetSystem() {
-    if(confirm("【警告】确定要恢复出厂设置吗？\n所有的定时参数、屏幕设置将被清空。")) {
-        if(confirm("【最后确认】请再次点击确定！\n确认后系统将自动重启并恢复默认设置。")) {
+    if(confirm("警告：确定要恢复出厂设置吗？\n所有的定时参数、屏幕设置将被清空。")) {
+        if(confirm("最后确认：请再次点击确定！\n确认后系统将自动重启并恢复默认设置。")) {
             fetch('/reset').then(() => {
                 alert('系统正在重置，请稍后重新连接热点 ESP32_Smart_Home');
             });
@@ -267,7 +274,7 @@ function connectWiFi() {
 }
 
 setInterval(updateData, 2000);
-setInterval(updateWave, 200);
+setInterval(updateWave, 300);
 </script>
 </body></html>
 )rawliteral";
@@ -383,7 +390,6 @@ void handleConnect() {
 void handleReset() {
   server.send(200, "text/plain", "Resetting...");
   delay(500);
-  // 安全兜底：强制切断继电器
   digitalWrite(RELAY_PIN, LOW);
   
   u8g2.setPowerSave(0);
@@ -394,7 +400,7 @@ void handleReset() {
   u8g2.sendBuffer();
   
   delay(1000);
-  ESP.restart(); // 重启后所有 RAM 恢复默认
+  ESP.restart(); 
 }
 
 // ================= 交互更新 =================
@@ -402,7 +408,7 @@ void updateInteraction() {
   lastInteractionTime = millis();
   if (!screenOn) {
     screenOn = true;
-    u8g2.setPowerSave(0); // 唤醒屏幕
+    u8g2.setPowerSave(0); 
     drawMainMenu();
   }
 }
@@ -410,6 +416,8 @@ void updateInteraction() {
 // ================= 初始化 =================
 void setup() {
   Serial.begin(115200);
+  delay(1000); // 防掉电缓冲
+
   Wire.begin(21, 22);
   
   pinMode(PIN_CLK, INPUT_PULLUP);
@@ -429,9 +437,14 @@ void setup() {
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf); 
 
+  delay(500); // 防掉电缓冲
+
   WiFi.softAP(apSSID.c_str(), apPass.c_str());
   WiFi.setSleep(false); 
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // 降低WiFi功耗防掉电
   configTime(8 * 3600, 0, "ntp.aliyun.com", "time.pool.aliyun.com");
+
+  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK); // 红外初始化
 
   server.on("/", handleRoot);
   server.on("/api/data", handleData);
@@ -459,14 +472,34 @@ void loop() {
     currentTimeStr = String(timeStr);
   }
 
+  // 红外解码逻辑
+  if (IrReceiver.decode()) {
+    if ((IrReceiver.decodedIRData.protocol != UNKNOWN) && !(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      irProtocol = String(getProtocolString(IrReceiver.decodedIRData.protocol));
+      char buf[10];
+      snprintf(buf, sizeof(buf), "0x%02X", IrReceiver.decodedIRData.address);
+      irAddress = String(buf);
+      snprintf(buf, sizeof(buf), "0x%02X", IrReceiver.decodedIRData.command);
+      irCommand = String(buf);
+      hasIRData = true;
+      lastIRReceiveTime = millis();
+    }
+    IrReceiver.resume();
+  }
+
+  if (hasIRData && (millis() - lastIRReceiveTime > 10000)) {
+    hasIRData = false;
+  }
+
   // 屏幕超时休眠检测
   if (screenOn && (millis() - lastInteractionTime > screenTimeout)) {
-    u8g2.setPowerSave(1); // 熄屏
+    u8g2.setPowerSave(1);
     screenOn = false;
   }
 
   unsigned long now = millis();
   
+  // 继电器逻辑
   if (isPulsing) {
     if (now - lastRelayAction >= pulseDuration) {
       digitalWrite(RELAY_PIN, LOW);
@@ -510,22 +543,21 @@ void loop() {
   // 编码器旋转检测
   int currentCLKState = digitalRead(PIN_CLK);
   if (currentCLKState != lastCLKState && currentCLKState == LOW) {
-    updateInteraction(); // 唤醒屏幕
+    updateInteraction(); 
     if (digitalRead(PIN_DT) != currentCLKState) menuIndex = (menuIndex + 1) % totalItems;
     else menuIndex = (menuIndex - 1 + totalItems) % totalItems;
     if (!inSubMode && screenOn) drawMainMenu();
   }
   lastCLKState = currentCLKState;
 
-  // 编码器按键检测（单击 / 双击 / 长按）
+  // 按键逻辑
   if (digitalRead(PIN_SW) == LOW) {
     if (!isButtonPressed) {
       isButtonPressed = true;
       isLongPressing = false;
       buttonPressStart = millis();
-      updateInteraction(); // 按下即唤醒
+      updateInteraction(); 
     } else {
-      // 长按检测 (1.5秒仅熄屏/亮屏)
       if (!isLongPressing && (millis() - buttonPressStart > 1500)) {
         isLongPressing = true;
         if (screenOn) {
@@ -550,11 +582,10 @@ void loop() {
     }
   }
 
-  // 处理单击/双击
   if (clickCount > 0 && (millis() - firstClickTime > 350)) {
     if (clickCount == 1) {
       if (!inSubMode) {
-        if (menuIndex == 8) { // 选中 Factory Reset
+        if (menuIndex == 8) { 
           inSubMode = true;
           resetConfirmStep = 0;
           u8g2.clearBuffer();
@@ -568,12 +599,9 @@ void loop() {
           u8g2.clearBuffer();
         }
       } else {
-        if (menuIndex == 8) { // Factory Reset 确认逻辑
-          if (resetConfirmStep == 0) {
-            resetConfirmStep = 1; // 第一次确认
-          } else if (resetConfirmStep == 1) {
-            resetConfirmStep = 2; // 准备执行
-          }
+        if (menuIndex == 8) { 
+          if (resetConfirmStep == 0) resetConfirmStep = 1;
+          else if (resetConfirmStep == 1) resetConfirmStep = 2;
         }
         else if (menuIndex == 2 && relayMode == MANUAL) { 
           relayState = !relayState;
@@ -590,7 +618,7 @@ void loop() {
     clickCount = 0; 
   }
 
-  // 子模式执行 (仅在屏幕亮时刷新屏幕)
+  // 子模式绘制
   if (inSubMode && screenOn) {
     if (menuIndex == 0) runRadarMode();
     else if (menuIndex == 1) runTempHumidMode();
@@ -677,14 +705,11 @@ void runRelayMode() {
   u8g2.sendBuffer();
 }
 
+// 心率模块：原版拉伸逻辑保持不动
 void runHeartbeatMode() {
   if (millis() - lastHeartTime > 30) { 
     lastHeartTime = millis();
     int raw = analogRead(HEART_PIN);
-    
-    static int lastValidRaw = 2000;
-    if (abs(raw - lastValidRaw) > 300) raw = lastValidRaw;
-    else lastValidRaw = raw;
     
     static float filteredVal = 2000;
     filteredVal = (filteredVal * 0.6) + (raw * 0.4);
@@ -735,7 +760,7 @@ void runHeartbeatMode() {
       if (now - lastBeatTime > 400 && now - lastBeatTime < 1500) {
         int instantBPM = 60000 / (now - lastBeatTime);
         if (bpm == 0) bpm = instantBPM;
-        else bpm = (bpm * 0.85) + (instantBPM * 0.15); 
+        else bpm = (bpm * 0.7) + (instantBPM * 0.3); 
         lastBeatTime = now;
       } else if (now - lastBeatTime >= 1500) {
         lastBeatTime = now; 
@@ -747,7 +772,9 @@ void runHeartbeatMode() {
       isInValley = false;
     }
 
-    if (now - lastBeatTime > 3000) bpm = 0;
+    if (now - lastBeatTime > 3000) {
+      bpm = 0;
+    }
 
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB10_tr);
@@ -762,21 +789,15 @@ void runHeartbeatMode() {
     }
 
     int dispMax = maxV, dispMin = minV;
-    if (dispMax - dispMin < 50) dispMax = dispMin + 50;
+    if (dispMax == dispMin) { dispMax += 10; dispMin -= 10; }
     
     int prevX = 0, prevY = 0;
     for (int i = 0; i < WAVE_SIZE; i++) {
       int idx = (waveIndex + i) % WAVE_SIZE;
       int y = map(heartWave[idx], dispMin, dispMax, 60, 20); 
-      y = constrain(y, 20, 60); 
-      
-      if (i > 0) {
-        if (abs(y - prevY) < 20) u8g2.drawLine(prevX, prevY, i, y);
-      }
-      prevX = i;
-      prevY = y;
+      if (i > 0) u8g2.drawLine(prevX, prevY, i, y);
+      prevX = i; prevY = y;
     }
-    
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(0, 64, "Dbl click to exit");
     u8g2.sendBuffer();
@@ -846,23 +867,22 @@ void runSoundMode() {
 }
 
 void runIRMode() {
-  if (digitalRead(IR_PIN) == LOW) {
-    static unsigned long lastIRSignal = 0;
-    lastIRSignal = millis();
-    u8g2.clearBuffer(); u8g2.drawStr(0, 10, "--- IR Receiver ---");
-    u8g2.setFont(u8g2_font_ncenB10_tr); u8g2.setCursor(0, 30); u8g2.print("Signal Detected!");
-    u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0, 60, "Dbl click to exit");
-    u8g2.sendBuffer();
-    delay(50); 
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 10, "--- IR Decoder ---");
+  
+  if (hasIRData) {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(0, 25); u8g2.print("Protocol: "); u8g2.print(irProtocol);
+    u8g2.setCursor(0, 38); u8g2.print("Address : "); u8g2.print(irAddress);
+    u8g2.setCursor(0, 51); u8g2.print("Command : "); u8g2.print(irCommand);
   } else {
-    static unsigned long lastIRSignal = 0;
-    if (millis() - lastIRSignal > 1500) {
-      u8g2.clearBuffer(); u8g2.drawStr(0, 10, "--- IR Receiver ---");
-      u8g2.setFont(u8g2_font_6x10_tf); u8g2.setCursor(0, 30); u8g2.print("Waiting...");
-      u8g2.drawStr(0, 60, "Dbl click to exit"); u8g2.sendBuffer();
-    }
-    delay(50);
+    u8g2.setFont(u8g2_font_ncenB10_tr); 
+    u8g2.setCursor(0, 35); u8g2.print("Waiting...");
+    u8g2.setFont(u8g2_font_6x10_tf);
   }
+  
+  u8g2.setCursor(0, 64); u8g2.print("Hold 10s | Dbl click to exit");
+  u8g2.sendBuffer();
 }
 
 void runWifiInfoMode() {
@@ -879,7 +899,7 @@ void runWifiInfoMode() {
 void runSystemInfoMode() {
   u8g2.clearBuffer();
   u8g2.drawStr(0, 10, "--- System Info ---");
-  u8g2.setCursor(0, 25); u8g2.print("AP Clients: "); u8g2.print(apState ? WiFi.softAPgetStationNum() : 0);
+  u8g2.setCursor(0, 25); u8g2.print("AP Clients: "); u8g2.print(WiFi.softAPgetStationNum());
   u8g2.setCursor(0, 35); u8g2.print("Free RAM : "); u8g2.print(ESP.getFreeHeap() / 1024); u8g2.print(" KB");
   u8g2.setCursor(0, 45); u8g2.print("Chip Temp: "); u8g2.print((int)temperatureRead()); u8g2.print(" C");
   u8g2.setCursor(0, 55); u8g2.print("Core Ver : "); u8g2.print(ESP.getSdkVersion());
